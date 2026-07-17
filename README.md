@@ -1,1 +1,1 @@
-# TurboQuant---VectorDB-
+# TurboQuant-VectorDB

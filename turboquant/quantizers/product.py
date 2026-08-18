@@ -29,6 +29,7 @@ import numpy as np
 
 from ..kmeans import kmeans
 from ..metrics import pairwise_l2_sq
+from ..validation import as_2d_float32, check_dim, warn_small_training_set
 from .base import BaseQuantizer
 
 
@@ -44,12 +45,16 @@ class ProductQuantizer(BaseQuantizer):
     """
 
     def __init__(self, dim: int, n_subspaces: int = 8, n_centroids: int = 256):
+        dim = check_dim(dim)
+        n_subspaces, n_centroids = int(n_subspaces), int(n_centroids)
+        if n_subspaces < 1:
+            raise ValueError(f"n_subspaces must be >= 1, got {n_subspaces}")
         if dim % n_subspaces != 0:
             raise ValueError(
                 f"dim={dim} must be divisible by n_subspaces={n_subspaces}"
             )
-        if n_centroids > 256:
-            raise ValueError("n_centroids > 256 would not fit in uint8 codes")
+        if not 1 <= n_centroids <= 256:
+            raise ValueError("n_centroids must be in [1, 256] to fit in uint8 codes")
         self.dim = dim
         self.M = n_subspaces
         self.ks = n_centroids
@@ -59,7 +64,8 @@ class ProductQuantizer(BaseQuantizer):
 
     def train(self, data: np.ndarray, n_iters: int = 25, seed: int = 0) -> "ProductQuantizer":
         """Run an independent k-means per subspace to learn the codebooks."""
-        data = np.asarray(data, dtype=np.float32)
+        data = as_2d_float32(data, name="training data", dim=self.dim)
+        warn_small_training_set(data.shape[0], self.ks, "ProductQuantizer")
         self.codebooks = np.stack(
             [
                 kmeans(self._sub(data, m), self.ks, n_iters=n_iters, seed=seed + m)
@@ -76,7 +82,7 @@ class ProductQuantizer(BaseQuantizer):
     def encode(self, data: np.ndarray) -> np.ndarray:
         """(n, d) float32 -> (n, M) uint8: nearest codebook entry per subspace."""
         self._check_trained()
-        data = np.asarray(data, dtype=np.float32)
+        data = as_2d_float32(data, name="data", dim=self.dim, allow_empty=True)
         codes = np.empty((data.shape[0], self.M), dtype=np.uint8)
         for m in range(self.M):
             dists = pairwise_l2_sq(self._sub(data, m), self.codebooks[m])
@@ -101,11 +107,32 @@ class ProductQuantizer(BaseQuantizer):
         during the scan.
         """
         self._check_trained()
-        queries = np.asarray(queries, dtype=np.float32)
+        queries = as_2d_float32(queries, name="queries", dim=self.dim)
         nq = queries.shape[0]
         lut = np.empty((nq, self.M, self.ks), dtype=np.float32)
         for m in range(self.M):
             lut[:, m, :] = pairwise_l2_sq(self._sub(queries, m), self.codebooks[m])
+        return lut
+
+    def compute_ip_lut(self, queries: np.ndarray) -> np.ndarray:
+        """Inner-product lookup tables: (nq, M, ks) of q_m . centroid.
+
+        The same trick as the L2 ADC table, for MIPS. It works because the
+        inner product decomposes over the subspaces exactly the way the
+        squared distance does:
+
+            q . x_hat = sum_m  q_m . codebook[m][code_m]
+
+        so a scan is again M lookups and adds per database vector, and
+        `adc_distances` accumulates this table unchanged. Note the result
+        is a *similarity*: rank it with `top_k_max`, not `top_k`.
+        """
+        self._check_trained()
+        queries = as_2d_float32(queries, name="queries", dim=self.dim)
+        nq = queries.shape[0]
+        lut = np.empty((nq, self.M, self.ks), dtype=np.float32)
+        for m in range(self.M):
+            lut[:, m, :] = self._sub(queries, m) @ self.codebooks[m].T
         return lut
 
     def adc_distances(self, lut: np.ndarray, codes: np.ndarray) -> np.ndarray:

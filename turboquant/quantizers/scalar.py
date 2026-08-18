@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..validation import as_2d_float32, check_dim
 from .base import BaseQuantizer
 
 
@@ -28,9 +29,12 @@ class ScalarQuantizer(BaseQuantizer):
     """
 
     def __init__(self, dim: int, bits: int = 8):
+        if isinstance(bits, bool) or not isinstance(bits, (int, np.integer)):
+            raise TypeError("bits must be an integer")
+        bits = int(bits)
         if not 1 <= bits <= 8:
             raise ValueError("bits must be in [1, 8]")
-        self.dim = dim
+        self.dim = check_dim(dim)
         self.bits = bits
         self.levels = (1 << bits) - 1  # max integer code value
         self.mins: np.ndarray | None = None
@@ -43,7 +47,7 @@ class ScalarQuantizer(BaseQuantizer):
         outlier would otherwise stretch the range and starve the bulk of
         the distribution of quantization levels.
         """
-        data = np.asarray(data, dtype=np.float32)
+        data = as_2d_float32(data, name="training data", dim=self.dim)
         lo = np.percentile(data, 0.1, axis=0).astype(np.float32)
         hi = np.percentile(data, 99.9, axis=0).astype(np.float32)
         self.mins = lo
@@ -56,7 +60,7 @@ class ScalarQuantizer(BaseQuantizer):
     def encode(self, data: np.ndarray) -> np.ndarray:
         """float32 (n, d) -> packed uint8 codes (n, ceil(d*bits/8))."""
         self._check_trained()
-        data = np.asarray(data, dtype=np.float32)
+        data = as_2d_float32(data, name="data", dim=self.dim, allow_empty=True)
         # Affine map to [0, levels], round to nearest level, clip outliers
         # (values beyond the trained percentile range saturate at 0/levels).
         q = np.rint((data - self.mins) / self.scales)

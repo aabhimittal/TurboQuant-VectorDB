@@ -11,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from .metrics import pairwise_l2_sq
+from .validation import as_2d_float32
 
 
 def _kmeans_pp_init(
@@ -60,24 +61,42 @@ def kmeans(
             iteration; a 100k sample estimates centroids nearly as well as
             the full set (FAISS defaults to 256 points per centroid).
     """
-    data = np.ascontiguousarray(data, dtype=np.float32)
-    n = data.shape[0]
+    data = as_2d_float32(data, name="training data")
+    n, d = data.shape
+    if k < 1:
+        raise ValueError(f"k must be >= 1, got {k}")
     if k > n:
         raise ValueError(f"k={k} exceeds number of training points n={n}")
     rng = np.random.default_rng(seed)
     if sample_size is not None and n > sample_size:
-        data = data[rng.choice(n, size=sample_size, replace=False)]
-        n = sample_size
+        # Never subsample below k: the empty-cluster repair and the
+        # k-means++ fallback both draw `replace=False` samples of size up
+        # to k, which would fail outright on a sample smaller than k.
+        take = max(sample_size, k)
+        if take < n:
+            data = data[rng.choice(n, size=take, replace=False)]
+            n = take
 
     centroids = _kmeans_pp_init(data, k, rng)
+    prev_assign: np.ndarray | None = None
     for _ in range(n_iters):
         # Assignment step: nearest centroid for every point (one matmul).
         assign = np.argmin(pairwise_l2_sq(data, centroids), axis=1)
-        # Update step: mean of each cluster, computed with bincount so it
-        # stays O(n*d) with no Python-level loop over clusters.
+        # Early stop: once no point changes cluster, Lloyd's algorithm is at
+        # a fixed point and every further iteration is identical work. On
+        # clustered data this typically fires well before n_iters.
+        if prev_assign is not None and np.array_equal(assign, prev_assign):
+            break
+        prev_assign = assign
+        # Update step: per-cluster means. `np.bincount` with weights does one
+        # cache-friendly pass per column; `np.add.at` on the (n, d) array
+        # would be the obvious alternative but NumPy's unbuffered ufunc.at
+        # path is roughly an order of magnitude slower.
         counts = np.bincount(assign, minlength=k).astype(np.float32)
-        sums = np.zeros_like(centroids)
-        np.add.at(sums, assign, data)
+        sums = np.stack(
+            [np.bincount(assign, weights=data[:, j], minlength=k) for j in range(d)],
+            axis=1,
+        ).astype(np.float32)
         nonempty = counts > 0
         centroids[nonempty] = sums[nonempty] / counts[nonempty, None]
         # Empty-cluster repair: respawn dead centroids on random points,
@@ -85,4 +104,5 @@ def kmeans(
         n_dead = int((~nonempty).sum())
         if n_dead:
             centroids[~nonempty] = data[rng.choice(n, size=n_dead, replace=False)]
+            prev_assign = None  # centroids moved; assignments must be redone
     return centroids

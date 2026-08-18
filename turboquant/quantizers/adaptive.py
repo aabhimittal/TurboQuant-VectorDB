@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..validation import as_2d_float32, check_dim
 from .base import BaseQuantizer
 
 _MAX_BITS = 8
@@ -36,10 +37,14 @@ _MAX_BITS = 8
 
 class AdaptiveBitQuantizer(BaseQuantizer):
     def __init__(self, dim: int, avg_bits: float = 4.0):
-        if not 0 < avg_bits <= _MAX_BITS:
+        avg_bits = float(avg_bits)
+        if not np.isfinite(avg_bits) or not 0 < avg_bits <= _MAX_BITS:
             raise ValueError(f"avg_bits must be in (0, {_MAX_BITS}]")
-        self.dim = dim
-        self.total_bits = int(round(avg_bits * dim))
+        self.dim = check_dim(dim)
+        # At least one bit total: a 0-bit codec would reconstruct every
+        # vector as the training mean and report a 0-byte footprint, which
+        # makes compression_ratio divide by zero.
+        self.total_bits = max(1, int(round(avg_bits * self.dim)))
         self.bits_per_dim: np.ndarray | None = None
         self.mins: np.ndarray | None = None
         self.scales: np.ndarray | None = None
@@ -51,7 +56,7 @@ class AdaptiveBitQuantizer(BaseQuantizer):
 
     # ------------------------------------------------------------------ train
     def train(self, data: np.ndarray) -> "AdaptiveBitQuantizer":
-        data = np.asarray(data, dtype=np.float32)
+        data = as_2d_float32(data, name="training data", dim=self.dim)
         lo = np.percentile(data, 0.1, axis=0).astype(np.float32)
         hi = np.percentile(data, 99.9, axis=0).astype(np.float32)
         span = np.maximum(hi - lo, 1e-12)
@@ -109,7 +114,7 @@ class AdaptiveBitQuantizer(BaseQuantizer):
     # ----------------------------------------------------------- encode/decode
     def encode(self, data: np.ndarray) -> np.ndarray:
         self._check_trained()
-        data = np.asarray(data, dtype=np.float32)
+        data = as_2d_float32(data, name="data", dim=self.dim, allow_empty=True)
         n = data.shape[0]
         bit_matrix = np.zeros((n, self._stream_bits), dtype=np.uint8)
         for b, dims, offset in self._groups:

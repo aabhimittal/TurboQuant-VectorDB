@@ -63,6 +63,7 @@ import numpy as np
 from ..metrics import pairwise_l2_sq, top_k
 from ..quantizers.adaptive import AdaptiveBitQuantizer
 from ..quantizers.product import ProductQuantizer
+from ..validation import as_2d_float32, check_dim, check_ids, check_k
 from .ivfpq import IVFPQIndex
 
 # Measured crossover between the two tier-2 codecs (see module docstring).
@@ -139,7 +140,10 @@ class TurboIndex:
         """
         if refine not in ("auto", "pq", "adaptive"):
             raise ValueError('refine must be "auto", "pq", or "adaptive"')
-        self.dim = dim
+        self.dim = check_dim(dim)
+        budget_bytes = float(budget_bytes)
+        if not np.isfinite(budget_bytes):
+            raise ValueError("budget_bytes must be finite")
         self.budget_bytes = budget_bytes
 
         m1, kind, param = _choose_split(dim, budget_bytes)
@@ -170,7 +174,7 @@ class TurboIndex:
         self.is_trained = False
 
     def train(self, data: np.ndarray, n_iters: int = 25, seed: int = 0) -> "TurboIndex":
-        data = np.asarray(data, dtype=np.float32)
+        data = as_2d_float32(data, name="training data", dim=self.dim)
         self.ivfpq.train(data, n_iters=n_iters, seed=seed)
         # Train the refiner on the tier-1 *error* of the training set --
         # the exact distribution it will encode at add() time.
@@ -186,12 +190,16 @@ class TurboIndex:
     def add(self, vectors: np.ndarray) -> None:
         if not self.is_trained:
             raise RuntimeError("TurboIndex must be trained before add()")
-        vectors = np.asarray(vectors, dtype=np.float32)
-        prev = self.ivfpq.ntotal
+        vectors = as_2d_float32(
+            vectors, name="vectors", dim=self.dim, allow_empty=True
+        )
+        if vectors.shape[0] == 0:
+            return
+        prev = self.ivfpq.n_slots
         self.ivfpq.add(vectors)
         # Tier-1 reconstruction of the vectors just added; the refiner
         # stores what tier 1 could not represent.
-        new_ids = np.arange(prev, self.ivfpq.ntotal)
+        new_ids = np.arange(prev, self.ivfpq.n_slots)
         stage2 = vectors - self.ivfpq.reconstruct(new_ids)
         codes = self.refiner.encode(stage2)
         if self.refine_codes is None:
@@ -199,12 +207,44 @@ class TurboIndex:
         else:
             self.refine_codes = np.vstack([self.refine_codes, codes])
 
+    # -------------------------------------------------------- delete / update
+    def remove_ids(self, ids: np.ndarray) -> int:
+        """Tombstone ids. Tier-2 codes stay put until `compact()`."""
+        return self.ivfpq.remove_ids(ids)
+
+    def update(self, ids: np.ndarray, vectors: np.ndarray) -> None:
+        """Replace vectors in place, re-encoding *both* tiers.
+
+        Tier 2 stores the error tier 1 makes on this specific vector, so
+        an update has to redo tier 1 first and then re-derive tier 2 from
+        the new reconstruction. Updating only tier 1 would leave a
+        correction term describing a vector that is no longer there --
+        worse than no correction at all, since re-ranking would trust it.
+        """
+        ids = check_ids(ids, self.ivfpq.n_slots)
+        vectors = as_2d_float32(vectors, name="vectors", dim=self.dim)
+        self.ivfpq.update(ids, vectors)
+        if ids.size:
+            self.refine_codes[ids] = self.refiner.encode(
+                vectors - self.ivfpq.reconstruct(ids)
+            )
+
+    def compact(self) -> np.ndarray:
+        """Reclaim tombstoned space in both tiers. Returns the old->new id map."""
+        mapping = self.ivfpq.compact()
+        if self.refine_codes is not None:
+            keep = mapping >= 0
+            self.refine_codes = np.ascontiguousarray(self.refine_codes[keep])
+        return mapping
+
     def search(
         self,
         queries: np.ndarray,
         k: int,
         n_probe: int = 8,
         rerank_factor: int = 8,
+        filter_mask: np.ndarray | None = None,
+        max_probe: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Two-tier cascade: IVFPQ shortlist, then full-budget re-rank.
 
@@ -212,11 +252,26 @@ class TurboIndex:
         rerank_factor * k candidates to tier 2. Because tier 2 scores
         with strictly more information than tier 1 (its own bytes PLUS
         tier 1's), widening the shortlist cannot systematically hurt.
+
+        `filter_mask` and `max_probe` pass straight through to tier 1 --
+        and note that the shortlist tier is asked for `rerank_factor * k`
+        survivors, not k, so escalation keeps the *re-ranker* fed rather
+        than merely producing k weak answers. A filtered cascade with a
+        starved shortlist re-ranks perfectly over the wrong candidates.
         """
-        queries = np.asarray(queries, dtype=np.float32)
+        k = check_k(k)
+        queries = as_2d_float32(queries, name="queries", dim=self.dim)
+        if int(rerank_factor) < 1:
+            raise ValueError("rerank_factor must be >= 1")
         nq = queries.shape[0]
-        shortlist = max(k, rerank_factor * k)
-        cand_ids, _ = self.ivfpq.search(queries, shortlist, n_probe=n_probe)
+        shortlist = max(k, int(rerank_factor) * k)
+        cand_ids, _ = self.ivfpq.search(
+            queries,
+            shortlist,
+            n_probe=n_probe,
+            filter_mask=filter_mask,
+            max_probe=max_probe,
+        )
 
         out_ids = np.full((nq, k), -1, dtype=np.int64)
         out_dists = np.full((nq, k), np.inf, dtype=np.float32)
@@ -243,5 +298,20 @@ class TurboIndex:
 
     @property
     def bytes_per_vector(self) -> float:
-        n = self.ivfpq.ntotal
+        """Resident bytes per stored slot, tombstones included.
+
+        Divided by `n_slots` rather than live `ntotal` on purpose: deleted
+        vectors still occupy their rows until `compact()`, and a
+        compression figure that improved every time you deleted something
+        would be measuring the wrong thing.
+        """
+        n = self.ivfpq.n_slots
         return self.memory_bytes / n if n else 0.0
+
+    @property
+    def ntotal(self) -> int:
+        return self.ivfpq.ntotal
+
+    @property
+    def n_deleted(self) -> int:
+        return self.ivfpq.n_deleted

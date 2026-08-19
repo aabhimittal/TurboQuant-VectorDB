@@ -251,13 +251,223 @@ Code: `turboquant/index/turbo.py` (`_choose_split` is the budget policy).
 
 ---
 
-## 8. Where each method belongs
+## 8. OPQ: the subspace split is a free parameter nobody sets
+
+Go back to how PQ carves a vector: dims 0–15 to subspace 0, 16–31 to
+subspace 1, and so on. Nothing justifies that split. It is the order the
+embedding model's output neurons happened to be written in.
+
+Two things go wrong because of it.
+
+**Unbalanced energy.** Variance across embedding dimensions is heavily
+skewed. Contiguous slicing hands one subspace most of the total variance
+and another almost none — but every subspace gets the same 256-entry
+codebook. The high-variance subspace is starved; the low-variance one
+spends 8 bits describing noise. Since total squared error is the *sum*
+over subspaces, the starved one dominates and the wasted bits cannot
+help it.
+
+**Correlation across boundaries.** PQ reconstructs by concatenation, so
+it can represent exactly zero correlation between subspaces. Any
+structure straddling a boundary is unrepresentable.
+
+Both are fixed by inserting a learned orthogonal rotation `R` before the
+split (Ge, He, Ke & Sun, 2013):
+
+```
+encode(x) = PQ.encode((x − μ) R)      decode(c) = PQ.decode(c) Rᵀ + μ
+```
+
+A rotation is the right tool for a specific reason: it is **free at query
+time and lossless in distance**. Orthogonality gives `‖q − x‖ = ‖qR − xR‖`,
+so rotating the query once (a d×d matvec, independent of database size)
+lets ordinary ADC run in the rotated space with no approximation
+introduced. Per-vector storage is unchanged — still M bytes. `R` is d×d
+floats of *shared* overhead: 64 KB at d=128, irrelevant beside a million
+codes.
+
+Learning `R` happens in two stages.
+
+**Parametric init — eigenvalue balancing.** Diagonalize the covariance,
+then deal eigen-directions to subspaces greedily: each direction, in
+descending eigenvalue order, goes to whichever subspace currently has the
+smallest summed log-variance. The log turns the product `det(Σ_m)` — the
+quantity PQ's error actually tracks — into something additive that a
+greedy rule can balance. Decorrelation comes free from using
+eigenvectors.
+
+**Non-parametric refinement — alternating optimization.** Then repeat:
+freeze `R` and train PQ on the rotated data; freeze the reconstruction
+`Ŷ` and solve for the best `R`:
+
+```
+min_R ‖X R − Ŷ‖²_F   subject to   Rᵀ R = I
+```
+
+This is the **orthogonal Procrustes problem**, with the closed form
+`R = U Vᵀ` from the SVD `Xᵀ Ŷ = U S Vᵀ`. Each half is a global optimum
+for its own variable, so the objective decreases monotonically.
+
+Measured (128-dim, flat search, identical bytes/vector):
+
+| | M=8 (32x) | M=16 (16x) |
+|---|---|---|
+| PQ | 0.064 | 0.093 |
+| OPQ, init only | 0.122 | 0.227 |
+| OPQ, 8 refinement rounds | **0.145** | **0.258** |
+
+A 2.3–2.8x recall lift for zero extra bytes. Note the init alone gets
+most of the way — variance balancing is doing the heavy lifting, and
+Procrustes refinement adds the rest.
+
+One practical finding: `R` has only d² parameters and converges long
+before codebooks do, so the alternating phase runs on a **subsample**. At
+M=16, a 4k sample over 8 rounds scored 0.251 in 5.5 s where the full 20k
+set scored 0.240 in 42.7 s — 8x faster and no worse. The shipped
+codebooks are then trained on all the data under the final rotation.
+
+Code: `turboquant/quantizers/opq.py`.
+
+---
+
+## 9. Anisotropic quantization: optimize the score, not the reconstruction
+
+Every quantizer so far minimizes `‖x − x̂‖²`, which treats all error
+directions as equally bad. For **maximum inner-product search** (MIPS) —
+the native metric for recommendation and retrieval models whose scores
+*are* dot products — that is provably the wrong objective.
+
+What search cares about is error in the score:
+
+```
+⟨q, x⟩ − ⟨q, x̂⟩ = ⟨q, r⟩,     r = x − x̂
+```
+
+Split the residual relative to the datapoint: `r = r∥ + r⊥`, where `r∥`
+lies along `x`. Now condition on the case that matters — `x` is a top
+result for `q`, so `q` points roughly *along* `x`. Then `⟨q, r⊥⟩` largely
+cancels: `q` has little component in those directions and their signs are
+unrelated to `x`. But `⟨q, r∥⟩` adds coherently to the score every single
+time. **Error parallel to the datapoint corrupts the ranking; error
+perpendicular to it mostly does not.**
+
+So weight them differently (Guo et al., ICML 2020):
+
+```
+loss(x, x̂) = η‖r∥‖² + ‖r⊥‖² = ‖r‖² + (η−1)⟨r, x̄⟩²,    x̄ = x/‖x‖
+```
+
+The second form is the useful one: this is plain PQ loss plus a penalty
+on the parallel component, so `η = 1` recovers PQ exactly.
+
+The catch is that `⟨r, x̄⟩` is a *full-vector* quantity, so subspace m's
+best code now depends on what the other subspaces chose. PQ's whole
+training trick — independent k-means per subspace — is gone. We recover
+tractability with **block coordinate descent**:
+
+- *Assign*: with other blocks frozen, the loss restricted to block m is a
+  closed-form quadratic in the candidate centroid, so the best code is
+  one `(n, ks)` argmin — still fully vectorized.
+- *Update*: with assignments frozen, the optimal centroid solves a small
+  `dsub × dsub` linear system per cluster instead of being a plain mean.
+  (At `η = 1` that system collapses back to the mean.)
+
+Measured (128-dim, M=16, 1000 queries):
+
+| η | MIPS recall@10 | L2 recall@10 | reconstruction MSE |
+|---|---|---|---|
+| 1.0 (= PQ) | 0.126 | 0.117 | 2.67 |
+| 4.0 | 0.438 | 0.125 | 2.81 |
+| 8.0 | 0.566 | 0.127 | 2.90 |
+| 16.0 | **0.605** | 0.135 | 3.00 |
+| 32.0 | 0.608 | 0.119 | 3.15 |
+
+Read the columns together, because that is the entire point: **MIPS
+recall nearly 5x's while reconstruction error steadily gets worse.** The
+quantizer is deliberately spending accuracy where it does not move
+scores. A method that improved both columns would not be evidence for
+the anisotropic argument — it would just be a better-tuned PQ.
+
+**And the honest null result.** On the same data L2-normalized to the
+unit sphere, the gain does not merely vanish, it inverts:
+
+| | PQ | η=2 | η=4 | η=8 | η=16 |
+|---|---|---|---|---|---|
+| raw | 0.141 | 0.240 | 0.420 | 0.553 | 0.579 |
+| unit-norm | 0.079 | 0.078 | 0.070 | 0.057 | 0.029 |
+
+This is the premise expiring, not a bug. The asymmetry pays because a
+datapoint's norm scales its score, so parallel error moves the score in
+proportion to `‖x‖`. Normalize, and every norm is 1: the score becomes
+pure angle, MIPS collapses to cosine — which is L2 on unit vectors — and
+no direction is privileged. Keep paying the penalty anyway and you are
+buying nothing with real accuracy, which is exactly the shape of that
+bottom row.
+
+**Rule:** AnisotropicPQ for MIPS over unnormalized vectors; for cosine,
+normalize and use any L2 index here.
+
+Code: `turboquant/quantizers/anisotropic.py`.
+
+---
+
+## 10. What a corpus does after you index it
+
+The textbook index is loaded once and frozen. Real ones are not, and the
+gaps show up as silent wrongness rather than errors.
+
+**Deletion.** Physically removing a vector renumbers everything after it,
+which breaks every id an application stored. So deletes are **tombstones**:
+a bit per slot, checked during the scan. Ids stay stable, deletion is
+O(1) per id and safe on a live index, and `compact()` later reclaims the
+space — returning the old→new id map, because any parallel per-id
+structure (TurboIndex's tier-2 codes, your metadata table) has to follow
+it. Reporting that map instead of hiding it is the difference between a
+correct compaction and a silently misaligned index.
+
+**Update.** Re-encoding in place is not enough: a changed vector may
+belong to a *different* coarse cell, and leaving it filed under the old
+one makes it invisible to queries near where it actually is. It must be
+unfiled and refiled. In TurboIndex there is a second trap — tier 2 stores
+the error tier 1 makes *on that specific vector*, so updating tier 1
+alone leaves a correction describing a vector that no longer exists,
+which is worse than no correction because re-ranking trusts it.
+
+**Filtered search and probe escalation.** "Nearest neighbors WHERE
+tenant_id = 7" is the query every production store must answer. The easy
+implementation filters after the ANN scan, and it fails in a specific,
+silent way: if the filter keeps 1% of the corpus, a scan yielding 600
+candidates leaves ~6 survivors, so a `k=10` query returns 6 results — or
+10 bad ones — and raises nothing. Recall collapses precisely when the
+filter is most selective.
+
+The fix is to make scan width respond to what *survives* instead of being
+fixed in advance: probe, count survivors, and while there are fewer than
+k, double the cell count and scan only the newly added cells. Work scales
+with how selective the filter turns out to be, and no cell is scanned
+twice. Measured at nprobe=4 against exact filtered ground truth:
+
+| Filter selectivity | Post-filter only | + escalation |
+|---|---|---|
+| 10% | 0.795 | 0.795 |
+| 1% | 0.530 (8.8/10 results) | 0.620 (10/10) |
+| 0.1% | 0.055 (0.6/10 results) | **0.500 (5.0/10)** |
+
+At 10% selectivity escalation never fires and costs nothing. At 0.1% it
+is the difference between a working index and a broken one.
+
+---
+
+## 11. Where each method belongs
 
 | Situation | Reach for |
 |---|---|
 | Memory is tight but not desperate; recall is sacred | SQ8 (4x, ~free) |
 | ~8x compression, anisotropic embeddings (i.e., real ones) | AdaptiveBits, or TurboIndex at `4·d/... ≈ d/2` bytes |
 | Extreme compression, recall negotiable | IVFPQ, small M |
+| Same bytes as PQ, more recall, one-off training cost | OPQ |
+| Inner-product scores over unnormalized vectors | AnisotropicPQ |
+| Cosine similarity | `normalize()`, then any L2 index |
 | A specific RAM budget to hit, best quality under it | TurboIndex with that budget |
 | Ground truth / evaluation | FlatIndex |
 
@@ -265,9 +475,16 @@ Code: `turboquant/index/turbo.py` (`_choose_split` is the budget policy).
 
 - Jégou, Douze, Schmid — *Product Quantization for Nearest Neighbor
   Search*, TPAMI 2011 (PQ, ADC, IVFADC).
+- Ge, He, Ke, Sun — *Optimized Product Quantization*, CVPR 2013 (OPQ,
+  eigenvalue balancing, Procrustes refinement).
+- Guo, Sun, Lindgren, Geng, Simcha, Chern, Kumar — *Accelerating
+  Large-Scale Inference with Anisotropic Vector Quantization*, ICML 2020
+  (score-aware loss; ScaNN).
 - Arthur, Vassilvitskii — *k-means++: The Advantages of Careful Seeding*,
   SODA 2007.
 - Gersho, Gray — *Vector Quantization and Signal Compression* (bit
   allocation / water-filling).
+- Schönemann — *A generalized solution of the orthogonal Procrustes
+  problem*, Psychometrika 1966.
 - Johnson, Douze, Jégou — *Billion-scale similarity search with GPUs*
   (FAISS), 2017.

@@ -33,6 +33,35 @@ def pairwise_l2_sq(queries: np.ndarray, database: np.ndarray) -> np.ndarray:
     return dists
 
 
+def inner_product(queries: np.ndarray, database: np.ndarray) -> np.ndarray:
+    """Inner-product scores: out[i, j] = queries[i] . database[j].
+
+    Maximum-inner-product search (MIPS) is the native metric for
+    recommendation and retrieval models whose scores are dot products.
+    Unlike L2 it is *not* a distance -- higher is better, the triangle
+    inequality does not hold, and a vector's norm can make it beat
+    better-aligned rivals. Callers therefore take the k largest.
+    """
+    return queries @ database.T
+
+
+def normalize(data: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Scale rows to unit L2 norm, for cosine similarity search.
+
+    Cosine search needs no separate code path: on unit vectors,
+
+        ||q - x||^2 = 2 - 2 * cos(q, x)
+
+    so L2 ordering and cosine ordering are identical. Normalizing at
+    ingest turns every L2 index in this library into an exact cosine
+    index. Zero rows have no direction; they are left at zero rather than
+    dividing by zero, which places them equidistant from everything.
+    """
+    data = np.asarray(data, dtype=np.float32)
+    norms = np.linalg.norm(data, axis=1, keepdims=True)
+    return data / np.maximum(norms, eps)
+
+
 def top_k(dists: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
     """Indices and distances of the k smallest entries per row.
 
@@ -48,6 +77,16 @@ def top_k(dists: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
     order = np.argsort(part_d, axis=1)  # sort only k elements
     idx = np.take_along_axis(part, order, axis=1)
     return idx, np.take_along_axis(part_d, order, axis=1)
+
+
+def top_k_max(scores: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+    """Indices and scores of the k *largest* entries per row (for MIPS).
+
+    Implemented by negating and reusing `top_k` so the two ranking paths
+    cannot drift apart in tie-breaking or padding behavior.
+    """
+    idx, neg = top_k(-scores, k)
+    return idx, -neg
 
 
 def recall_at_k(approx_ids: np.ndarray, exact_ids: np.ndarray, k: int) -> float:

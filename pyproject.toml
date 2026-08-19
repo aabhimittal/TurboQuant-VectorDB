@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "turboquant"
-version = "0.1.0"
-description = "Vector quantization for ANN search from scratch: SQ, adaptive-bit SQ, PQ, IVFPQ, and a budget-driven cascade index"
+version = "0.2.0"
+description = "Vector quantization for ANN search from scratch: SQ, adaptive-bit SQ, PQ, OPQ, anisotropic PQ, IVFPQ, and a budget-driven cascade index"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
